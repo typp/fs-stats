@@ -1,0 +1,257 @@
+#! /usr/bin/env lua
+
+local DEBUG = false
+
+local _ = require('underscore')
+
+local unit = {
+    K  = 1,
+    M  = 1024,
+    dG = 1024 ^ 2 / 10,
+    G  = 1024 ^ 2,
+    T  = 1024 ^ 4
+}
+
+local settings = {
+    default = {
+        unit = 'G',
+        group_below = true
+    },
+    drives = {
+        ['/'] = {
+            order = 1,
+            unit = 'G',
+            critical = 4 * unit['G']
+        },
+        ['/home'] = {
+            order = 2,
+            critical = 20 * unit['G'],
+            group_below = false
+        },
+        ['/var'] = {
+            order = 3,
+            unit = 'M',
+            critical = 1 * unit['G']
+        },
+        ['/tmp'] = {
+            order = 4,
+            unit = 'M',
+            critical = 1 * unit['G']
+        },
+        ['/dev/shm'] = {
+            order = 5,
+            unit = 'M',
+            critical = 0.5 * unit['G'],
+            group_below = false
+        }
+    },
+    filter_out = {
+        '/dev', '/run', '/sys/fs/cgroup', '/run/user/[0-9]+'
+    },
+    filter_gsub = {
+        ['^/run/media/[^/]+/(.+)$'] = '/m/%1',
+        ['^/media/(.+)$'] = '/m/%1'
+    }
+}
+
+local colors_palette = {
+    html = {
+        grey = '<span foreground="#666">',
+        red = '<span foreground="#B22">',
+        green = '<span foreground="#6B8">',
+        reset = '</span>'
+    },
+    ansi = {
+        grey = '[30m',
+        red = '[31m',
+        green = '[32m',
+        reset = '[m'
+    },
+    none = {
+        grey = '',
+        red = '',
+        green = '',
+        reset = ''
+    }
+}
+
+_.pull = function (collection, field)
+    local values = {}
+    for key,element in pairs(collection) do
+        if element[field] then table.insert(values, element[field]) end
+    end
+    return values
+end
+
+_.printcoll = function (collection)
+    local output = '{ '
+    local first = true
+    for key, value in pairs(collection or {}) do
+        if not first then
+            output = output .. '\n  '
+        else
+            first = false
+        end
+        output = output .. '"' .. tostring(key) .. '" = ' .. tostring(value)
+    end
+    print(output .. ' }')
+end
+
+_.copy = function (orig)
+    local orig_type = type(orig)
+    local copy
+    if orig_type == 'table' then
+        copy = {}
+        for orig_key, orig_value in pairs(orig) do
+            copy[orig_key] = orig_value
+        end
+    else -- number, string, boolean, etc
+        copy = orig
+    end
+    return copy
+end
+
+local format_disk_size = function (size, unit_desc, tail)
+    return tail
+        and ('%.0f %s'):format(size / unit[unit_desc], unit_desc)
+        or  ('%.0f'):format(size / unit[unit_desc])
+end
+
+local scan_devices = function ()
+    local pattern          = '^.-[%s]([%d]+)[%D]+([%d]+)[%D]+([%d]+)[%D]+([%d]+)%%[%s]+([%p%w]+)'
+    local devices_data     = {}
+    local reserved_indexes = _.pull(settings.drives, 'order')
+    local filter_out       = _.map(settings.filter_out, function (value) return '^' .. value .. '$' end)
+    local filter_gsub_keys = _.keys(settings.filter_gsub)
+    local index            = 1
+    local stream           = assert(io.popen('LC_ALL=C df -kP'))
+    repeat index = index + 1
+    until not _.any(reserved_indexes, function (reserved) return index == reserved end)
+    for line in stream:lines() do
+        local size, used, avail, ratio, mountpoint = line:match(pattern)
+        if used and mountpoint then
+            local sets = _.copy(settings['default'])
+            _.extend(sets, settings['drives'][mountpoint] or {})
+            if not _.any(filter_out, function (pattern) return mountpoint:match(pattern) end) then
+                order = sets['order']
+                local pattern = _.detect(filter_gsub_keys, function (pattern) return mountpoint:match(pattern) end)
+                if pattern then
+                    mountpoint = mountpoint:gsub(pattern, settings.filter_gsub[pattern])
+                end
+                local data = {
+                    size       = format_disk_size(tonumber(size), sets['unit'], true),
+                    used       = format_disk_size(tonumber(used), sets['unit'], false),
+                    avail      = format_disk_size(tonumber(avail), sets['unit'], false),
+                    ratio      = tonumber(ratio),
+                    mountpoint = mountpoint,
+                    join       = sets['group_below']
+                }
+                if DEBUG then
+                    print('O:'..(order or '-'), 'I:'..index)
+                    _.printcoll(data)
+                    print('')
+                end
+                devices_data[order or index] = data
+                if not order then
+                    repeat index = index + 1
+                    until not _.any(reserved_indexes, function (reserved) return index == reserved end)
+                end
+            end
+        end
+    end
+    stream:close()
+    return devices_data
+end
+
+local display = function (devices_data, c)
+    local output
+    local frame
+    local label_fmt
+    local counter_fmt
+    local label_column_size
+    local counter_column_size
+    local padding
+    local ccs_correction = -2
+    local separate = false
+
+    frame = {
+        t_measures = '0          25           50           75         100',
+        top        = '┌───────────┬────────────┬────────────┬───────────┐',
+        empty      =  '                                                 ',
+        split      = '├────┴────┴─┬──┴────┴────┼────┴────┴──┬─┴────┴────┤',
+        inner      =  '|||||||||||||||||||||||||||||||||||||||||||||||||',
+        bottom     = '└────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘',
+        b_measures = '0   10   20   30   40   50   60   70   80   90  100',
+        border     = '│',
+        inner_ch   = '|'
+    }
+    frame['length'] = string.len(frame['inner']) - 1
+
+    label_column_size = 2 + _(devices_data):chain()
+        :pluck('mountpoint')
+        :reduce(1, function (acc, cur) return #cur > acc and #cur or acc end)
+        :value()
+
+    counter_column_size = _(devices_data):chain()
+        :pluck('size')
+        :reduce(1, function (acc, cur) return #cur > acc and #cur or acc end)
+        -- :reduce(1, function (acc, cur)
+        --     local len = string.len(('%.0f'):format(cur / 1024^2))
+        --     return len > acc and len or acc end)
+        :value()
+
+    label_fmt = '%-' .. label_column_size .. 's'
+    padding = label_fmt:format('')
+    counter_fmt = frame['border'] .. '  %' .. counter_column_size + ccs_correction .. 's / %' .. counter_column_size .. 's'
+    output = '\n ' .. padding .. frame['t_measures'] .. '\n ' .. padding .. frame['top'] .. '\n'
+
+    for index,data in ipairs(devices_data) do
+        local ratio = math.ceil(data['ratio'] / 2)
+        local used  = data['used']
+        local size  = data['size']
+        if separate then
+            output = output .. ' ' .. padding .. frame['split'] .. '\n'
+        end
+        output = output .. ' ' .. string.format(label_fmt .. frame['border'], data['mountpoint'])
+        if ratio == 0 then
+            output = output .. frame['empty']
+        else
+            output = output .. c['green'] .. frame['inner']:sub(0, ratio) .. c['reset']
+            output = output .. c['grey'] .. frame['empty']:sub(ratio, frame['length']) .. c['reset']
+        end
+        output = output .. counter_fmt:format(used, size) .. ' \n'
+        separate = not data['join']
+    end
+
+    output = output .. ' ' .. padding .. frame['bottom'] .. '\n'
+    output = output .. ' ' .. padding .. frame['b_measures']
+
+    print(output)
+end
+
+main = function ()
+    local colors
+    local devices
+
+    colors = colors_palette.none
+    if arg[1] == '-Oansi' then colors = colors_palette.ansi end
+    if arg[1] == '-Ohtml' then colors = colors_palette.html end
+
+    devices = scan_devices()
+    display(devices, colors)
+end
+
+string.split = function (str)
+    local sp = {}
+    local i = 0
+	for value in string.gmatch(str, '%S+') do
+		sp[i] = value
+        i = i + 1
+	end
+    return sp
+end
+
+
+main()
+
+-- vim:ts=4:et:sw=4
